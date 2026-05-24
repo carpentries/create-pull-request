@@ -121,12 +121,20 @@ export async function createPullRequest(inputs: Inputs): Promise<void> {
         `The 'base' and 'branch' for a pull request must be different branches. Unable to continue.`
       )
     }
-    // For self-hosted runners the repository state persists between runs.
-    // This command prunes the stale remote ref when the pull request branch was
-    // deleted after being merged or closed. Without this the push using
-    // '--force-with-lease' fails due to "stale info."
-    // https://github.com/peter-evans/create-pull-request/issues/633
-    await git.exec(['remote', 'prune', branchRemoteName])
+    if (utils.isSelfHosted()) {
+      // For self-hosted runners the repository state persists between runs.
+      // This command prunes the stale remote ref when the pull request branch was
+      // deleted after being merged or closed. Without this the push using
+      // '--force-with-lease' fails due to "stale info."
+      // https://github.com/peter-evans/create-pull-request/issues/633
+      try {
+        await git.exec(['remote', 'prune', branchRemoteName])
+      } catch (error) {
+        core.warning(
+          `Failed to prune remote '${branchRemoteName}': ${(error as Error).message}`
+        )
+      }
+    }
     core.endGroup()
 
     // Apply the branch suffix if set

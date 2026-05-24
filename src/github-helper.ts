@@ -1,7 +1,13 @@
 import * as core from '@actions/core'
+import {RequestError} from '@octokit/request-error'
 import {Inputs} from './create-pull-request'
 import {Commit, GitCommandManager} from './git-command-manager'
-import {Octokit, OctokitOptions, throttleOptions} from './octokit-client'
+import {
+  Octokit,
+  OctokitOptions,
+  retryOptions,
+  throttleOptions
+} from './octokit-client'
 import pLimit from 'p-limit'
 import * as utils from './utils'
 
@@ -52,6 +58,7 @@ export class GitHubHelper {
       options.baseUrl = 'https://api.github.com'
     }
     options.throttle = throttleOptions
+    options.retry = retryOptions
     this.octokit = new Octokit(options)
   }
 
@@ -61,6 +68,50 @@ export class GitHubHelper {
       owner: owner,
       repo: repo
     }
+  }
+
+  private async getPullNumber(
+    baseRepository: string,
+    headBranch: string,
+    baseBranch: string
+  ): Promise<number> {
+    const {data: pulls} = await this.octokit.rest.pulls.list({
+      ...this.parseRepository(baseRepository),
+      state: 'open',
+      head: headBranch,
+      base: baseBranch
+    })
+    let pullNumber: number | undefined = undefined
+    if (pulls?.length === 0 || pulls === null || pulls === undefined) {
+      // This is a fallback due to a bug that affects the list endpoint when called on forks with the same owner as the repository parent.
+      core.info(
+        `Pull request not found via list endpoint; attempting fallback mechanism`
+      )
+      for await (const response of this.octokit.paginate.iterator(
+        this.octokit.rest.pulls.list,
+        {
+          ...this.parseRepository(baseRepository),
+          state: 'open',
+          base: baseBranch
+        }
+      )) {
+        const existingPull = response.data.find(
+          pull => pull.head.label === headBranch
+        )
+        if (existingPull !== undefined) {
+          pullNumber = existingPull.number
+          break
+        }
+      }
+    } else {
+      pullNumber = pulls[0].number
+    }
+    if (pullNumber === undefined) {
+      throw new Error(
+        `Failed to find pull request number for branch ${headBranch}`
+      )
+    }
+    return pullNumber
   }
 
   private async createOrUpdate(
@@ -113,16 +164,15 @@ export class GitHubHelper {
 
     // Update the pull request that exists for this branch and base
     core.info(`Fetching existing pull request`)
-    const {data: pulls} = await this.octokit.rest.pulls.list({
-      ...this.parseRepository(baseRepository),
-      state: 'open',
-      head: headBranch,
-      base: inputs.base
-    })
+    const pullNumber = await this.getPullNumber(
+      baseRepository,
+      headBranch,
+      inputs.base
+    )
     core.info(`Attempting update of pull request`)
     const {data: pull} = await this.octokit.rest.pulls.update({
       ...this.parseRepository(baseRepository),
-      pull_number: pulls[0].number,
+      pull_number: pullNumber,
       title: inputs.title,
       body: inputs.body
     })
@@ -160,32 +210,51 @@ export class GitHubHelper {
       headRepository
     )
 
+    // After creating a new PR, follow-up API calls can fail with a 422
+    // "Could not resolve to a node" error due to GitHub API eventual
+    // consistency. Wrap post-creation calls with targeted retry logic.
+    // See: https://github.com/peter-evans/create-pull-request/issues/4321
+    const isEventualConsistencyError = (e: unknown): boolean =>
+      e instanceof RequestError &&
+      e.status === 422 &&
+      e.message.includes('Could not resolve to a node')
+    const withRetryForNewPr = <T>(fn: () => Promise<T>): Promise<T> =>
+      pull.created
+        ? utils.retryWithBackoff(fn, isEventualConsistencyError)
+        : fn()
+
     // Apply milestone
     if (inputs.milestone) {
       core.info(`Applying milestone '${inputs.milestone}'`)
-      await this.octokit.rest.issues.update({
-        ...this.parseRepository(baseRepository),
-        issue_number: pull.number,
-        milestone: inputs.milestone
-      })
+      await withRetryForNewPr(() =>
+        this.octokit.rest.issues.update({
+          ...this.parseRepository(baseRepository),
+          issue_number: pull.number,
+          milestone: inputs.milestone
+        })
+      )
     }
     // Apply labels
     if (inputs.labels.length > 0) {
       core.info(`Applying labels '${inputs.labels}'`)
-      await this.octokit.rest.issues.addLabels({
-        ...this.parseRepository(baseRepository),
-        issue_number: pull.number,
-        labels: inputs.labels
-      })
+      await withRetryForNewPr(() =>
+        this.octokit.rest.issues.addLabels({
+          ...this.parseRepository(baseRepository),
+          issue_number: pull.number,
+          labels: inputs.labels
+        })
+      )
     }
     // Apply assignees
     if (inputs.assignees.length > 0) {
       core.info(`Applying assignees '${inputs.assignees}'`)
-      await this.octokit.rest.issues.addAssignees({
-        ...this.parseRepository(baseRepository),
-        issue_number: pull.number,
-        assignees: inputs.assignees
-      })
+      await withRetryForNewPr(() =>
+        this.octokit.rest.issues.addAssignees({
+          ...this.parseRepository(baseRepository),
+          issue_number: pull.number,
+          assignees: inputs.assignees
+        })
+      )
     }
 
     // Request reviewers and team reviewers
@@ -201,11 +270,13 @@ export class GitHubHelper {
     }
     if (Object.keys(requestReviewersParams).length > 0) {
       try {
-        await this.octokit.rest.pulls.requestReviewers({
-          ...this.parseRepository(baseRepository),
-          pull_number: pull.number,
-          ...requestReviewersParams
-        })
+        await withRetryForNewPr(() =>
+          this.octokit.rest.pulls.requestReviewers({
+            ...this.parseRepository(baseRepository),
+            pull_number: pull.number,
+            ...requestReviewersParams
+          })
+        )
       } catch (e) {
         if (utils.getErrorMessage(e).includes(ERROR_PR_REVIEW_TOKEN_SCOPE)) {
           core.error(
